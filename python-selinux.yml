@@ -1,0 +1,201 @@
+---
+- name: Build docker containers
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Build docker container
+      docker_container:
+        name: "{{ inventory_hostname }}"
+        image: "centos:{{ release }}"
+        state: started
+        command: sleep infinity
+      vars:
+        ansible_python_interpreter: "./docker.pex"
+      delegate_to: localhost
+
+- name: Bootstrap docker containers
+  hosts: all
+  gather_facts: false
+  vars:
+    ansible_connection: docker
+    ansible_python_interpreter: /usr/bin/python2.7
+  tasks:
+    - name: Test ansible round trip
+      ping:
+      ignore_errors: true
+      register: ping_test
+
+    - name: Install python
+      raw: yum install python
+      when: ping_test is failed
+
+- name: Prepare for libselinux-python36 wheel build
+  hosts: all
+  gather_facts: false
+  vars:
+    ansible_connection: docker
+    ansible_python_interpreter: /usr/bin/python2.7
+  tasks:
+    - name: Install SCL
+      yum:
+        name: centos-release-scl
+
+    - name: Install Python36
+      yum:
+        name:
+          - rh-python36
+          - rh-python36-python-devel
+          - rh-python36-python-pip
+          - rh-python36-python-wheel
+
+    - name: Install dev tools
+      yum:
+        name:
+          - gcc
+          - gcc-c++
+          - make
+          - yum-utils
+          - rpmdevtools
+        state: latest
+
+    - user:
+        name: mockbuild
+
+    - name: Create RPM cache directory
+      file:
+        path: /rpm
+        state: directory
+
+    - name: Gather names of RPM packages
+      command: "yumdownloader --urls --source {{ item }}"
+      loop:
+        - libselinux
+      register: url_result
+
+    - name: Set facts for RPM package names
+      set_fact:
+        libselinux_filename: "{{ url_result.results[0].stdout_lines|last|basename }}"
+
+    - name: Download src.rpm files
+      command: "yumdownloader --source --destdir /rpm {{ item }}"
+      loop:
+        - libselinux
+
+    - name: Install build deps for src.rpm files
+      command: "yum-builddep -y /rpm/{{ item }}"
+      loop:
+        - "{{ libselinux_filename }}"
+
+- name: Build libselinux-python36 wheels
+  hosts: all
+  gather_facts: false
+  vars:
+    ansible_connection: docker
+    ansible_python_interpreter: /usr/bin/python2.7
+    ansible_user: mockbuild
+  tasks:
+    - name: Install src.rpm files
+      command: "rpm -ivh /rpm/{{ item }}"
+      args:
+        warn: False
+      loop:
+        - "{{ libselinux_filename }}"
+
+    - name: Extract sources
+      unarchive:
+        src: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}.tar.gz"
+        dest: "~/rpmbuild/SOURCES/"
+        remote_src: yes
+
+    - name: List patches
+      command: spectool -P libselinux.spec
+      args:
+        chdir: "~/rpmbuild/SPECS"
+      register: patches
+
+    - name: Patch
+      command: patch -p0 -i {{ item.split()[1] }}
+      args:
+        chdir: "~/rpmbuild/SOURCES"
+      loop: "{{ patches.stdout_lines }}"
+
+    - name: Get version
+      command: rpm -q --qf "%{VERSION}-%{RELEASE}\n" --specfile libselinux.spec
+      args:
+        chdir: "~/rpmbuild/SPECS"
+        warn: false
+      register: version
+
+    - name: Run make
+      command: >-
+        scl enable rh-python36 -- make PYTHON=python3 LIBDIR=/usr/lib64
+        CFLAGS="-g -O2 -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fexceptions -fstack-protector-strong --param=ssp-buffer-size=4 -grecord-gcc-switches   -m64 -mtune=generic" -j4
+        pywrap
+      args:
+        chdir: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}"
+
+    - name: Make selinux dir
+      file:
+        path: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/selinux"
+        state: directory
+
+    - name: Copy additional remote files
+      copy:
+        remote_src: true
+        src: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/{{ item.src }}"
+        dest: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/{{ item.dest }}"
+      loop:
+        - src: src/selinux.py
+          dest: src/selinux/__init__.py
+        - src: src/python3_selinux.so
+          dest: src/selinux/_selinux.so
+        - src: src/python3audit2why.so
+          dest: src/selinux/audit2why.so
+        - src: LICENSE
+          dest: src/LICENSE
+
+    - name: Remove selinux.py
+      file:
+        path: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/selinux.py"
+        state: absent
+
+    - name: Copy python build files
+      copy:
+        src: "{{ item }}"
+        dest: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/"
+      loop:
+        - setup.py
+        - MANIFEST.in
+
+    - name: Build wheel
+      command: scl enable rh-python36 -- python3 setup.py bdist_wheel
+      args:
+        chdir: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/"
+      environment:
+        VERSION: "{{ version.stdout_lines[0] }}"
+
+    - name: Find wheel files
+      find:
+        path: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/dist/"
+        patterns: "*.whl"
+      register: wheels
+
+    - name: Fetch python wheel files
+      fetch:
+        dest: "wheelhouse/{{ item.path|basename }}"
+        src: "{{ item.path }}"
+        flat: true
+      with_items: "{{ wheels.files }}"
+
+- name: Destroy docker containers
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Destroy docker container
+      docker_container:
+        name: "{{ inventory_hostname }}"
+        state: absent
+      vars:
+        ansible_python_interpreter: "./docker.pex"
+      delegate_to: localhost
+      when: keep_containers|default(True)|bool
