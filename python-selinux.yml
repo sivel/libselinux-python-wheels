@@ -165,10 +165,11 @@
         dest: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/"
       loop:
         - setup.py
+        - setup.cfg
         - MANIFEST.in
 
     - name: Build wheel
-      command: scl enable rh-python36 -- python3 setup.py bdist_wheel
+      command: scl enable rh-python36 -- python3 setup.py bdist_wheel --plat-name el7_x86_64
       args:
         chdir: "~/rpmbuild/SOURCES/{{ libselinux_filename.split('-')[:2]|join('-') }}/src/"
       environment:
@@ -198,4 +199,4 @@
       vars:
         ansible_python_interpreter: "./docker.pex"
       delegate_to: localhost
-      when: keep_containers|default(True)|bool
+      when: not keep_containers|default(True)|bool
